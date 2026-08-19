@@ -386,3 +386,144 @@ class TestFullRoundTripConsistency:
         _, msgs = convert_responses_input_to_unified(inp, None, dropped)
         assert msgs == []
         assert unified_tools is None
+
+
+# ==================================================================================================
+# Codex 0.148 ID correlation — call_id must be the canonical correlation key
+# ==================================================================================================
+
+class TestCodexIdCorrelation:
+    """
+    Codex 0.148 sends function_call with both 'id' (fc_tooluse_...) and
+    'call_id' (tooluse_...).  The matching function_call_output uses call_id.
+    The canonical correlation ID must be call_id so toolUse.toolUseId ==
+    toolResult.toolUseId in the Kiro payload.
+    """
+
+    def _assert_ids_match(self, msgs):
+        """Assert every tool_call id in assistant messages has a matching tool_result."""
+        assistant_ids = {}
+        for m in msgs:
+            if m.role == "assistant":
+                for tc in (m.tool_calls or []):
+                    assistant_ids[tc["id"]] = tc["function"]["name"]
+        for m in msgs:
+            if m.tool_results:
+                for tr in m.tool_results:
+                    rid = tr["tool_use_id"]
+                    assert rid in assistant_ids, (
+                        f"tool_result id={rid!r} has no matching assistant tool_call. "
+                        f"Known IDs: {list(assistant_ids)}"
+                    )
+
+    def test_call_id_used_as_canonical_id(self):
+        """When both id and call_id present, call_id wins for correlation."""
+        inp = [
+            {"type": "function_call", "id": "fc_tooluse_123", "call_id": "tooluse_123",
+             "name": "exec_command", "arguments": '{"cmd":"pwd"}'},
+            {"type": "function_call_output", "call_id": "tooluse_123", "output": "/home"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        # assistant tool_call id must be call_id value
+        assert msgs[0].tool_calls[0]["id"] == "tooluse_123"
+        # tool_result id must also be call_id value
+        assert msgs[1].tool_results[0]["tool_use_id"] == "tooluse_123"
+        self._assert_ids_match(msgs)
+
+    def test_call_id_used_as_canonical_id_name_preserved(self):
+        """Tool name must survive the conversion unchanged."""
+        inp = [
+            {"type": "function_call", "id": "fc_tooluse_123", "call_id": "tooluse_123",
+             "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tooluse_123", "output": "ok"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        assert msgs[0].tool_calls[0]["function"]["name"] == "exec_command"
+
+    def test_only_call_id(self):
+        """function_call with only call_id (no id field)."""
+        inp = [
+            {"type": "function_call", "call_id": "tooluse_abc", "name": "run",
+             "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tooluse_abc", "output": "done"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        assert msgs[0].tool_calls[0]["id"] == "tooluse_abc"
+        assert msgs[1].tool_results[0]["tool_use_id"] == "tooluse_abc"
+        self._assert_ids_match(msgs)
+
+    def test_only_id(self):
+        """function_call with only id (no call_id) — id used as fallback."""
+        inp = [
+            {"type": "function_call", "id": "call_xyz", "name": "search",
+             "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_xyz", "output": "results"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        assert msgs[0].tool_calls[0]["id"] == "call_xyz"
+        assert msgs[1].tool_results[0]["tool_use_id"] == "call_xyz"
+        self._assert_ids_match(msgs)
+
+    def test_multiple_sequential_tool_calls(self):
+        """Two function_calls each with both id/call_id — both pairs must correlate."""
+        inp = [
+            {"type": "function_call", "id": "fc_1", "call_id": "tu_1",
+             "name": "tool_a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tu_1", "output": "res_a"},
+            {"type": "function_call", "id": "fc_2", "call_id": "tu_2",
+             "name": "tool_b", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tu_2", "output": "res_b"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        # First assistant / user pair
+        assert msgs[0].tool_calls[0]["id"] == "tu_1"
+        # Second assistant / user pair
+        asst2 = next(m for m in msgs[1:] if m.role == "assistant")
+        assert asst2.tool_calls[0]["id"] == "tu_2"
+        self._assert_ids_match(msgs)
+
+    def test_multi_turn_session_id_correlation(self):
+        """user → fc → fco → user → fc → fco; both turns must correlate."""
+        inp = [
+            {"type": "message", "role": "user", "content": "turn 1"},
+            {"type": "function_call", "id": "fc_t1", "call_id": "tu_t1",
+             "name": "fn1", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tu_t1", "output": "r1"},
+            {"type": "message", "role": "user", "content": "turn 2"},
+            {"type": "function_call", "id": "fc_t2", "call_id": "tu_t2",
+             "name": "fn2", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tu_t2", "output": "r2"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        self._assert_ids_match(msgs)
+        # Check no fc_ prefix leaked through
+        for m in msgs:
+            for tc in (m.tool_calls or []):
+                assert not tc["id"].startswith("fc_"), \
+                    f"fc_-prefixed id leaked: {tc['id']!r}"
+
+    def test_namespace_tool_id_correlation(self):
+        """namespace tool (mapped to function) — call_id must be canonical."""
+        dropped: set = set()
+        inp = [
+            {"type": "function_call", "id": "fc_sh1", "call_id": "sh1",
+             "name": "shell", "arguments": '{"cmd":"ls"}'},
+            {"type": "function_call_output", "call_id": "sh1", "output": "file.txt"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None, dropped)
+        assert msgs[0].tool_calls[0]["id"] == "sh1"
+        assert msgs[1].tool_results[0]["tool_use_id"] == "sh1"
+        self._assert_ids_match(msgs)
+
+    def test_tool_call_after_developer_message(self):
+        """developer message followed by function_call+output — IDs must correlate."""
+        inp = [
+            {"type": "message", "role": "developer", "content": "context"},
+            {"type": "function_call", "id": "fc_dev1", "call_id": "dev1",
+             "name": "my_tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "dev1", "output": "result"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        asst = next(m for m in msgs if m.role == "assistant" and m.tool_calls)
+        assert asst.tool_calls[0]["id"] == "dev1"
+        self._assert_ids_match(msgs)

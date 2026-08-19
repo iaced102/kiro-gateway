@@ -147,7 +147,7 @@ def convert_responses_input_to_unified(
 
         if item_type == "function_call":
             fc_name = item.get("name", "")
-            fc_id = item.get("id") or item.get("call_id", "")
+            fc_id = item.get("call_id") or item.get("id") or ""
 
             if fc_name in _dropped:
                 # The tool definition was skipped (e.g. web_search hosted tool).
@@ -211,7 +211,7 @@ def convert_responses_input_to_unified(
                 for block in content_raw:
                     if isinstance(block, dict) and block.get("type") == "function_call":
                         tool_calls.append({
-                            "id": block.get("id") or block.get("call_id", ""),
+                            "id": block.get("call_id") or block.get("id") or "",
                             "type": "function",
                             "function": {
                                 "name": block.get("name", ""),
@@ -362,6 +362,62 @@ def _log_kiro_payload_summary(payload: dict) -> None:
         pass
 
 
+def _validate_kiro_tool_consistency(payload: dict) -> None:
+    """
+    Validate tool use / tool result consistency in the Kiro payload.
+
+    Logs a DEBUG line per tool interaction showing name, IDs, and MATCH status.
+    Raises ValueError (→ HTTP 400) when:
+    - any toolUse has an empty name
+    - any toolResult has no matching toolUse in the immediately preceding assistant entry
+    """
+    conv = payload.get("conversationState", {})
+    history = conv.get("history", [])
+    current = conv.get("currentMessage", {})
+    uim = current.get("userInputMessage", {})
+    cur_ctx = uim.get("userInputMessageContext", {})
+
+    # Build a flat list of (entry_type, data) for sequential scanning
+    entries = list(history) + [{"userInputMessage": uim}]
+
+    last_tool_use_ids: set = set()
+    errors = []
+
+    for entry in entries:
+        if "assistantResponseMessage" in entry:
+            arm = entry["assistantResponseMessage"]
+            last_tool_use_ids = set()
+            for tu in arm.get("toolUses", []):
+                name = tu.get("name", "")
+                uid = tu.get("toolUseId", "")
+                last_tool_use_ids.add(uid)
+                logger.debug(
+                    f"[Responses] tool_use name={name!r} id={uid!r}"
+                )
+                if not name:
+                    errors.append(f"toolUse has empty name (toolUseId={uid!r})")
+
+        elif "userInputMessage" in entry:
+            m = entry["userInputMessage"]
+            ctx = m.get("userInputMessageContext", {})
+            for tr in ctx.get("toolResults", []):
+                uid = tr.get("toolUseId", "")
+                match = uid in last_tool_use_ids
+                logger.debug(
+                    f"[Responses] tool_result id={uid!r} MATCH={match}"
+                )
+                if not match and uid:
+                    errors.append(
+                        f"toolResult toolUseId={uid!r} has no matching toolUse "
+                        f"(preceding toolUse IDs: {sorted(last_tool_use_ids)})"
+                    )
+
+    if errors:
+        raise ValueError(
+            "Kiro payload tool consistency error: " + "; ".join(errors)
+        )
+
+
 def extract_thinking_config_from_responses(request: CreateResponseRequest) -> ThinkingConfig:
     """Extract ThinkingConfig from a Responses API request."""
     if not request.reasoning_effort:
@@ -425,5 +481,8 @@ def build_kiro_payload_from_responses(
 
     # Compact DEBUG summary of what will be sent to Kiro
     _log_kiro_payload_summary(result.payload)
+
+    # Validate tool use / result consistency — raises ValueError (→ HTTP 400) on mismatch
+    _validate_kiro_tool_consistency(result.payload)
 
     return result.payload
