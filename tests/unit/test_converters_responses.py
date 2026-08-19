@@ -527,3 +527,52 @@ class TestCodexIdCorrelation:
         asst = next(m for m in msgs if m.role == "assistant" and m.tool_calls)
         assert asst.tool_calls[0]["id"] == "dev1"
         self._assert_ids_match(msgs)
+
+
+# ==================================================================================================
+# Empty name tracing — raw logging guards
+# ==================================================================================================
+
+class TestFunctionCallNameExtraction:
+
+    def test_name_field_present_is_preserved(self):
+        inp = [{"type": "function_call", "id": "fc_1", "call_id": "c1",
+                "name": "exec_command", "arguments": '{"cmd": "pwd"}'}]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        assert msgs[0].tool_calls[0]["function"]["name"] == "exec_command"
+
+    def test_name_field_absent_gives_empty_string(self):
+        # Codex may omit name — we must not crash, just log warning
+        inp = [{"type": "function_call", "id": "fc_1", "call_id": "c1",
+                "arguments": "{}"}]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        assert msgs[0].tool_calls[0]["function"]["name"] == ""
+
+    def test_function_call_with_role_assistant_still_hits_function_call_branch(self):
+        # Even if Codex sends role="assistant" on a function_call item, item_type
+        # check fires first (line 148 before line 190), so name is preserved.
+        inp = [{"type": "function_call", "role": "assistant",
+                "id": "fc_1", "call_id": "c1",
+                "name": "my_tool", "arguments": "{}"}]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        assert msgs[0].role == "assistant"
+        assert msgs[0].tool_calls[0]["function"]["name"] == "my_tool"
+
+    def test_namespace_field_does_not_affect_name(self):
+        # If Codex sends a `namespace` field alongside `name`, name wins
+        inp = [{"type": "function_call", "id": "fc_1", "call_id": "c1",
+                "name": "shell", "namespace": "local",
+                "arguments": "{}"}]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        assert msgs[0].tool_calls[0]["function"]["name"] == "shell"
+
+    def test_tool_calls_debug_log_structure(self):
+        # Verify tool_calls dict has the expected structure for converters_core
+        inp = [{"type": "function_call", "id": "fc_1", "call_id": "c1",
+                "name": "get_data", "arguments": '{"q": 1}'}]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        tc = msgs[0].tool_calls[0]
+        assert "function" in tc
+        assert "name" in tc["function"]
+        assert "arguments" in tc["function"]
+        assert tc["function"]["name"] == "get_data"

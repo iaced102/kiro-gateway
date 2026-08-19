@@ -146,8 +146,21 @@ def convert_responses_input_to_unified(
             continue
 
         if item_type == "function_call":
+            logger.debug(
+                f"[Responses] RAW function_call: "
+                f"id={item.get('id')!r} "
+                f"call_id={item.get('call_id')!r} "
+                f"name={item.get('name')!r} "
+                f"namespace={item.get('namespace')!r} "
+                f"keys={list(item.keys())!r}"
+            )
             fc_name = item.get("name", "")
             fc_id = item.get("call_id") or item.get("id") or ""
+
+            if not fc_name:
+                logger.warning(
+                    f"[Responses] function_call has empty name — raw item: {item!r}"
+                )
 
             if fc_name in _dropped:
                 # The tool definition was skipped (e.g. web_search hosted tool).
@@ -179,6 +192,7 @@ def convert_responses_input_to_unified(
                     "arguments": item.get("arguments", "{}"),
                 },
             }]
+            logger.debug(f"[Responses] function_call -> tool_calls={tool_calls!r}")
             unified.append(UnifiedMessage(
                 role="assistant",
                 content="",
