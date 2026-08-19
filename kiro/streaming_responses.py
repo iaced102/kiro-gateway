@@ -4,10 +4,13 @@
 Streaming logic for converting Kiro stream to OpenAI Responses API format.
 
 SSE events emitted follow the OpenAI Responses API streaming spec:
-  response.created, response.output_item.added, response.content_part.added,
-  response.output_text.delta, response.output_text.done, response.content_part.done,
-  response.output_item.done, response.function_call_arguments.delta,
-  response.function_call_arguments.done, response.done
+  response.created, response.in_progress,
+  response.output_item.added, response.content_part.added,
+  response.output_text.delta, response.output_text.done,
+  response.content_part.done, response.output_item.done,
+  response.function_call_arguments.delta,
+  response.function_call_arguments.done,
+  response.completed  ← terminal event (NOT response.done)
 """
 
 import json
@@ -79,6 +82,7 @@ async def stream_kiro_to_responses(
         "usage": None,
     }
     yield _sse("response.created", {"type": "response.created", "response": initial_response})
+    yield _sse("response.in_progress", {"type": "response.in_progress", "response": initial_response})
 
     try:
         async for event in parse_kiro_stream(
@@ -277,7 +281,7 @@ async def stream_kiro_to_responses(
             "total_tokens": input_tokens + output_tokens,
         },
     }
-    yield _sse("response.done", {"type": "response.done", "response": final_response})
+    yield _sse("response.completed", {"type": "response.completed", "response": final_response})
 
 
 async def collect_responses_response(
