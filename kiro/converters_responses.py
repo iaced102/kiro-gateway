@@ -301,15 +301,19 @@ def convert_responses_tools_to_unified(
 ) -> tuple:
     """Convert Responses API tool definitions to unified format.
 
-    Returns (unified_tools_or_None, dropped_tool_names) where dropped_tool_names
-    is the set of tool names whose definitions were skipped so callers can strip
-    any history items that reference them.
+    Returns (unified_tools_or_None, dropped_tool_names, namespace_map) where:
+    - dropped_tool_names: set of names skipped (hosted tools, empty namespaces)
+    - namespace_map: dict mapping flattened child_name -> parent namespace_name,
+      used to restore the correct Responses API namespace identity when emitting
+      function_call results back to Codex.  Duplicate child names across different
+      namespaces: last writer wins (a warning is logged).
     """
     if not tools:
-        return None, set()
+        return None, set(), {}
 
     result = []
     dropped_names: set = set()
+    namespace_map: Dict[str, str] = {}
 
     for tool in tools:
         if not isinstance(tool, dict):
@@ -365,6 +369,13 @@ def convert_responses_tools_to_unified(
                     description=nested.get("description") or f"Tool: {nested_name}",
                     input_schema=params,
                 ))
+                if nested_name in namespace_map:
+                    logger.warning(
+                        f"[Responses] Duplicate child name '{nested_name}' across namespaces "
+                        f"('{namespace_map[nested_name]}' and '{name}') — keeping first mapping"
+                    )
+                else:
+                    namespace_map[nested_name] = name
                 logger.debug(
                     f"[Responses] Flattened namespace '{name}' -> tool '{nested_name}'"
                 )
@@ -388,7 +399,7 @@ def convert_responses_tools_to_unified(
             if name:
                 dropped_names.add(name)
 
-    return result or None, dropped_names
+    return result or None, dropped_names, namespace_map
 
 
 def _log_kiro_payload_summary(payload: dict) -> None:
@@ -565,7 +576,7 @@ def build_kiro_payload_from_responses(
         )
 
     # Convert tools first so we know which names were dropped before processing input.
-    unified_tools, dropped_tool_names = convert_responses_tools_to_unified(request_data.tools)
+    unified_tools, dropped_tool_names, namespace_map = convert_responses_tools_to_unified(request_data.tools)
 
     system_prompt, unified_messages = convert_responses_input_to_unified(
         request_data.input, request_data.instructions, dropped_tool_names
@@ -598,4 +609,4 @@ def build_kiro_payload_from_responses(
     # Validate tool use / result consistency — raises ValueError (→ HTTP 400) on mismatch
     _validate_kiro_tool_consistency(result.payload)
 
-    return result.payload
+    return result.payload, namespace_map

@@ -98,7 +98,7 @@ async def create_response(
             profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
 
             try:
-                kiro_payload = build_kiro_payload_from_responses(
+                kiro_payload, _namespace_map = build_kiro_payload_from_responses(
                     request_data, conversation_id, profile_arn_for_payload
                 )
             except ValueError as e:
@@ -137,6 +137,7 @@ async def create_response(
                                     initial_response=response,
                                     request_messages=input_items,
                                     request_tools=tools_for_tokenizer,
+                                    namespace_map=_namespace_map,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -164,6 +165,7 @@ async def create_response(
                         resp_data = await collect_responses_response(
                             response, request_data.model, model_cache, auth_manager,
                             request_messages=input_items, request_tools=tools_for_tokenizer,
+                            namespace_map=_namespace_map,
                         )
                         await http_client.close()
                         logger.info("HTTP 200 - POST /v1/responses (non-streaming) - completed")
@@ -236,7 +238,7 @@ async def create_response(
         profile_arn_for_payload = auth_manager.profile_arn or PROFILE_ARN or ""
 
         try:
-            kiro_payload = build_kiro_payload_from_responses(
+            kiro_payload, _namespace_map = build_kiro_payload_from_responses(
                 request_data, conversation_id, profile_arn_for_payload
             )
         except ValueError as e:
@@ -290,6 +292,7 @@ async def create_response(
                             initial_response=response,
                             request_messages=input_items,
                             request_tools=tools_for_tokenizer,
+                            namespace_map=_namespace_map,
                         ):
                             yield chunk
                     except GeneratorExit:
@@ -317,6 +320,7 @@ async def create_response(
                 resp_data = await collect_responses_response(
                     response, request_data.model, model_cache, auth_manager,
                     request_messages=input_items, request_tools=tools_for_tokenizer,
+                    namespace_map=_namespace_map,
                 )
                 await http_client.close()
                 logger.info("HTTP 200 - POST /v1/responses (non-streaming) - completed")

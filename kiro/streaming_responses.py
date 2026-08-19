@@ -73,6 +73,7 @@ async def stream_kiro_to_responses(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
+    namespace_map: Optional[Dict[str, str]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Convert a Kiro API streaming response to OpenAI Responses API SSE format.
@@ -163,17 +164,21 @@ async def stream_kiro_to_responses(
                     f"arguments_length={len(arguments)}"
                 )
 
+                _ns_map = namespace_map or {}
+                _fc_item_base: Dict[str, Any] = {
+                    "type": "function_call",
+                    "id": tool_item["id"],
+                    "call_id": tool_item["call_id"],
+                    "name": tool_item["name"],
+                    "arguments": "",
+                    "status": "in_progress",
+                }
+                if name in _ns_map:
+                    _fc_item_base["namespace"] = _ns_map[name]
                 yield _sse("response.output_item.added", {
                     "type": "response.output_item.added",
                     "output_index": tool_output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": tool_item["id"],
-                        "call_id": tool_item["call_id"],
-                        "name": tool_item["name"],
-                        "arguments": "",
-                        "status": "in_progress",
-                    },
+                    "item": _fc_item_base,
                 })
                 # Emit arguments as a single delta + done
                 yield _sse("response.function_call_arguments.delta", {
@@ -188,17 +193,20 @@ async def stream_kiro_to_responses(
                     "output_index": tool_output_index,
                     "arguments": tool_item["arguments"],
                 })
+                _fc_item_done: Dict[str, Any] = {
+                    "type": "function_call",
+                    "id": tool_item["id"],
+                    "call_id": tool_item["call_id"],
+                    "name": tool_item["name"],
+                    "arguments": tool_item["arguments"],
+                    "status": "completed",
+                }
+                if name in _ns_map:
+                    _fc_item_done["namespace"] = _ns_map[name]
                 yield _sse("response.output_item.done", {
                     "type": "response.output_item.done",
                     "output_index": tool_output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": tool_item["id"],
-                        "call_id": tool_item["call_id"],
-                        "name": tool_item["name"],
-                        "arguments": tool_item["arguments"],
-                        "status": "completed",
-                    },
+                    "item": _fc_item_done,
                 })
 
             elif event.type == "usage":
@@ -274,16 +282,20 @@ async def stream_kiro_to_responses(
             pass
 
     # Build final output list
+    _ns_map_final = namespace_map or {}
     output_list = []
     for t in tool_items:
-        output_list.append({
+        _fc_entry: Dict[str, Any] = {
             "type": "function_call",
             "id": t["id"],
             "call_id": t["call_id"],
             "name": t["name"],
             "arguments": t["arguments"],
             "status": "completed",
-        })
+        }
+        if t["name"] in _ns_map_final:
+            _fc_entry["namespace"] = _ns_map_final[t["name"]]
+        output_list.append(_fc_entry)
     if content_started:
         output_list.append({
             "type": "message",
@@ -316,6 +328,7 @@ async def collect_responses_response(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
+    namespace_map: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     Collect a full (non-streaming) response in Responses API format.
@@ -336,14 +349,17 @@ async def collect_responses_response(
             elif event.type == "tool_use":
                 tool = event.tool_use or {}
                 call_id, name, arguments = _normalize_tool_use(tool)
-                tool_items.append({
+                _fc_collected: Dict[str, Any] = {
                     "type": "function_call",
                     "id": f"fc_{call_id}",
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments,
                     "status": "completed",
-                })
+                }
+                if name in (namespace_map or {}):
+                    _fc_collected["namespace"] = (namespace_map or {})[name]
+                tool_items.append(_fc_collected)
                 logger.debug(f"[Responses] collected function_call name={name!r} call_id={call_id!r}")
             elif event.type == "usage":
                 usage = event.usage or {}
@@ -413,6 +429,7 @@ async def stream_with_first_token_retry_responses(
     initial_response: httpx.Response,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
+    namespace_map: Optional[Dict[str, str]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Wrapper that retries on FirstTokenTimeoutError, then delegates to stream_kiro_to_responses.
@@ -433,6 +450,7 @@ async def stream_with_first_token_retry_responses(
                 current_response, model, model_cache, auth_manager,
                 request_messages=request_messages,
                 request_tools=request_tools,
+                namespace_map=namespace_map,
             ):
                 yield chunk
             return
