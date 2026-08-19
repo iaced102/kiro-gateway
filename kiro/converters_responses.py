@@ -83,24 +83,18 @@ def convert_responses_input_to_unified(
         return system_prompt, []
 
     unified: List[UnifiedMessage] = []
+    # Accumulates function_call_output items until the next user message claims them.
+    # Flushing as a standalone empty-user message would create two consecutive user
+    # messages that merge_adjacent_messages collapses incorrectly for multi-turn threads.
     pending_tool_results: List[Dict[str, Any]] = []
 
-    def flush_tool_results():
-        if pending_tool_results:
-            unified.append(UnifiedMessage(
-                role="user",
-                content="",
-                tool_results=list(pending_tool_results),
-            ))
-            pending_tool_results.clear()
-
     # Item types produced by built-in hosted tools that Kiro doesn't support.
-    # We skip them entirely rather than letting them corrupt the conversation structure.
+    # Defined once outside the loop.
     _SKIP_ITEM_TYPES = frozenset({
-        "reasoning",          # thinking/reasoning blocks
-        "computer_call",      # computer-use action
+        "reasoning",
+        "computer_call",
         "computer_call_output",
-        "web_search_call",    # web search action
+        "web_search_call",
         "web_search_call_output",
         "image_generation_call",
         "image_generation_call_output",
@@ -124,7 +118,7 @@ def convert_responses_input_to_unified(
             continue
 
         if item_type == "function_call_output":
-            # Tool result
+            # Accumulate tool results; they will be attached to the next user message.
             pending_tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": item.get("call_id", ""),
@@ -132,11 +126,18 @@ def convert_responses_input_to_unified(
             })
             continue
 
-        # For function_call or message items, flush any pending tool results first
-        flush_tool_results()
-
         if item_type == "function_call":
-            # Assistant tool call
+            # Pending tool results before a new function_call mean a multi-step tool
+            # chain where no user message arrived between calls.  Attach them to a
+            # synthetic user message so Kiro history stays valid.
+            if pending_tool_results:
+                unified.append(UnifiedMessage(
+                    role="user",
+                    content="",
+                    tool_results=list(pending_tool_results),
+                ))
+                pending_tool_results.clear()
+
             tool_calls = [{
                 "id": item.get("id") or item.get("call_id", ""),
                 "type": "function",
@@ -157,7 +158,14 @@ def convert_responses_input_to_unified(
             content_raw = item.get("content", "")
 
             if role == "system":
-                # Merge into system prompt
+                # Pending tool results before a system message: flush as standalone.
+                if pending_tool_results:
+                    unified.append(UnifiedMessage(
+                        role="user",
+                        content="",
+                        tool_results=list(pending_tool_results),
+                    ))
+                    pending_tool_results.clear()
                 system_prompt = (system_prompt + "\n" + _content_to_text(content_raw)).strip()
                 continue
 
@@ -181,10 +189,22 @@ def convert_responses_input_to_unified(
                     unified.append(UnifiedMessage(
                         role="assistant",
                         content=text,
-                        tool_calls=tool_calls or None,
+                        tool_calls=tool_calls,
                         images=images,
                     ))
                     continue
+
+            if role == "user" and pending_tool_results:
+                # Attach accumulated tool results directly to this user message
+                # instead of creating a separate empty-user message first.
+                unified.append(UnifiedMessage(
+                    role="user",
+                    content=text,
+                    tool_results=list(pending_tool_results),
+                    images=images,
+                ))
+                pending_tool_results.clear()
+                continue
 
             unified.append(UnifiedMessage(
                 role=role or "user",
@@ -192,7 +212,14 @@ def convert_responses_input_to_unified(
                 images=images,
             ))
 
-    flush_tool_results()
+    # Flush any remaining tool results (e.g. conversation ended after tool call).
+    if pending_tool_results:
+        unified.append(UnifiedMessage(
+            role="user",
+            content="",
+            tool_results=list(pending_tool_results),
+        ))
+
     return system_prompt, unified
 
 
