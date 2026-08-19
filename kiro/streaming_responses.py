@@ -61,7 +61,7 @@ def _normalize_tool_use(tool: dict) -> tuple:
     return call_id, name, arguments
 
 
-
+def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
