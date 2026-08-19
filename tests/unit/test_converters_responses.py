@@ -541,12 +541,12 @@ class TestFunctionCallNameExtraction:
         _, msgs = convert_responses_input_to_unified(inp, None)
         assert msgs[0].tool_calls[0]["function"]["name"] == "exec_command"
 
-    def test_name_field_absent_gives_empty_string(self):
-        # Codex may omit name — we must not crash, just log warning
+    def test_name_field_absent_is_dropped(self):
+        # function_call with no name is dropped (empty name -> invalid Kiro toolUse)
         inp = [{"type": "function_call", "id": "fc_1", "call_id": "c1",
                 "arguments": "{}"}]
         _, msgs = convert_responses_input_to_unified(inp, None)
-        assert msgs[0].tool_calls[0]["function"]["name"] == ""
+        assert msgs == []
 
     def test_function_call_with_role_assistant_still_hits_function_call_branch(self):
         # Even if Codex sends role="assistant" on a function_call item, item_type
@@ -576,3 +576,147 @@ class TestFunctionCallNameExtraction:
         assert "name" in tc["function"]
         assert "arguments" in tc["function"]
         assert tc["function"]["name"] == "get_data"
+
+
+# ==================================================================================================
+# Streaming tool serialization — _normalize_tool_use
+# ==================================================================================================
+
+class TestNormalizeToolUse:
+    """Tests for _normalize_tool_use helper in streaming_responses.py."""
+
+    def test_unified_format_name_and_args_extracted(self):
+        from kiro.streaming_responses import _normalize_tool_use
+        tool = {
+            "id": "tooluse_123",
+            "type": "function",
+            "function": {"name": "exec_command", "arguments": '{"cmd":"pwd"}'},
+        }
+        call_id, name, args = _normalize_tool_use(tool)
+        assert call_id == "tooluse_123"
+        assert name == "exec_command"
+        assert args == '{"cmd":"pwd"}'
+
+    def test_dict_arguments_serialized_to_json_string(self):
+        from kiro.streaming_responses import _normalize_tool_use
+        tool = {
+            "id": "tooluse_123",
+            "type": "function",
+            "function": {"name": "exec_command", "arguments": {"cmd": "pwd"}},
+        }
+        _, name, args = _normalize_tool_use(tool)
+        assert name == "exec_command"
+        assert '"cmd"' in args
+
+    def test_missing_function_key_returns_empty_name(self):
+        from kiro.streaming_responses import _normalize_tool_use
+        tool = {"id": "tooluse_123"}
+        call_id, name, args = _normalize_tool_use(tool)
+        assert call_id == "tooluse_123"
+        assert name == ""
+        assert args == "{}"
+
+    def test_empty_function_dict_returns_empty_name(self):
+        from kiro.streaming_responses import _normalize_tool_use
+        tool = {"id": "tooluse_123", "type": "function", "function": {}}
+        call_id, name, args = _normalize_tool_use(tool)
+        assert name == ""
+        assert call_id == "tooluse_123"
+
+    def test_missing_id_returns_empty_call_id(self):
+        from kiro.streaming_responses import _normalize_tool_use
+        tool = {"type": "function", "function": {"name": "tool_a", "arguments": "{}"}}
+        call_id, name, args = _normalize_tool_use(tool)
+        assert call_id == ""
+        assert name == "tool_a"
+
+
+# ==================================================================================================
+# Corrupted history (empty name from earlier gateway bug)
+# ==================================================================================================
+
+class TestCorruptedHistory:
+
+    def test_empty_name_function_call_dropped(self):
+        inp = [
+            {"type": "function_call", "id": "fc_tooluse_123", "call_id": "tooluse_123",
+             "name": "", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tooluse_123", "output": "/workspace"},
+            {"type": "message", "role": "user", "content": "continue"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        for m in msgs:
+            for tc in (m.tool_calls or []):
+                assert tc.get("function", {}).get("name") != ""
+
+    def test_empty_name_output_also_dropped(self):
+        inp = [
+            {"type": "function_call", "id": "fc_tooluse_123", "call_id": "tooluse_123",
+             "name": "", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tooluse_123", "output": "/workspace"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        for m in msgs:
+            for tr in (m.tool_results or []):
+                assert tr.get("tool_use_id") != "tooluse_123"
+
+    def test_valid_call_after_corrupted_call_survives(self):
+        inp = [
+            {"type": "function_call", "id": "fc_bad", "call_id": "bad_id",
+             "name": "", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "bad_id", "output": "ignored"},
+            {"type": "function_call", "id": "fc_good", "call_id": "good_id",
+             "name": "exec_command", "arguments": '{"cmd":"ls"}'},
+            {"type": "function_call_output", "call_id": "good_id", "output": "/workspace"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        names = [tc["function"]["name"] for m in msgs if m.tool_calls for tc in m.tool_calls]
+        assert "exec_command" in names
+        assert "" not in names
+
+
+# ==================================================================================================
+# Multi-turn replay — confirmed failure mode
+# ==================================================================================================
+
+class TestMultiTurnReplay:
+
+    def test_valid_function_call_name_preserved_in_round_trip(self):
+        inp = [
+            {"type": "function_call", "id": "fc_tooluse_123", "call_id": "tooluse_123",
+             "name": "exec_command", "arguments": '{"cmd":"pwd"}'},
+            {"type": "function_call_output", "call_id": "tooluse_123", "output": "/workspace"},
+            {"type": "message", "role": "user", "content": "continue"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        assert msgs[0].role == "assistant"
+        assert msgs[0].tool_calls[0]["function"]["name"] == "exec_command"
+        assert msgs[0].tool_calls[0]["function"]["arguments"] == '{"cmd":"pwd"}'
+        tool_use_id = msgs[0].tool_calls[0]["id"]
+        user_msg = next(m for m in msgs if m.tool_results)
+        assert any(tr["tool_use_id"] == tool_use_id for tr in user_msg.tool_results)
+
+    def test_sequential_calls_names_preserved(self):
+        inp = [
+            {"type": "function_call", "id": "fc_1", "call_id": "id_1", "name": "tool_a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "id_1", "output": "result_a"},
+            {"type": "function_call", "id": "fc_2", "call_id": "id_2", "name": "tool_b", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "id_2", "output": "result_b"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        names = [tc["function"]["name"] for m in msgs if m.tool_calls for tc in m.tool_calls]
+        assert "tool_a" in names
+        assert "tool_b" in names
+
+    def test_call_id_used_as_canonical_correlation_id(self):
+        """When both id and call_id present, call_id must be canonical for correlation."""
+        inp = [
+            {"type": "function_call", "id": "fc_tooluse_999", "call_id": "tooluse_999",
+             "name": "my_tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "tooluse_999", "output": "ok"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None)
+        # assistant tool_calls[0].id must be the call_id value
+        assert msgs[0].tool_calls[0]["id"] == "tooluse_999"
+        # tool_result must reference the same id
+        assert msgs[1].tool_results[0]["tool_use_id"] == "tooluse_999"

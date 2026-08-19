@@ -158,9 +158,17 @@ def convert_responses_input_to_unified(
             fc_id = item.get("call_id") or item.get("id") or ""
 
             if not fc_name:
+                # Historical function_call with empty name — produced by earlier gateway
+                # bug where tool name/args were serialized from the wrong dict level.
+                # Drop the structured call and its matching output to avoid generating
+                # a Kiro toolUse with name="" which causes REQUEST_BODY_INVALID.
                 logger.warning(
-                    f"[Responses] function_call has empty name — raw item: {item!r}"
+                    f"[Responses] Dropping function_call with empty name "
+                    f"(id={item.get('id')!r} call_id={item.get('call_id')!r}). "
+                    f"Matching function_call_output will also be dropped."
                 )
+                dropped_call_ids.add(fc_id)
+                continue
 
             if fc_name in _dropped:
                 # The tool definition was skipped (e.g. web_search hosted tool).

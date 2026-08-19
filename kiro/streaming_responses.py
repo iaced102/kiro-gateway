@@ -42,7 +42,26 @@ except ImportError:
     debug_logger = None
 
 
-def _sse(event: str, data: Any) -> str:
+def _normalize_tool_use(tool: dict) -> tuple:
+    """Extract (call_id, name, arguments) from a KiroEvent tool_use dict.
+
+    KiroEvent.tool_use uses the gateway's unified/OpenAI-style format:
+      {"id": "tooluse_...", "type": "function", "function": {"name": "...", "arguments": "..."}}
+
+    This is the internal contract established by AwsEventStreamParser._process_tool_start_event.
+    """
+    call_id = tool.get("id", "")
+    func = tool.get("function") or {}
+    name = func.get("name", "")
+    arguments = func.get("arguments", "{}")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+    if not name:
+        logger.error(f"[Responses] tool_use has empty name: raw={tool!r}")
+    return call_id, name, arguments
+
+
+
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
@@ -127,16 +146,22 @@ async def stream_kiro_to_responses(
             elif event.type == "tool_use":
                 tool = event.tool_use or {}
                 tool_output_index = len(tool_items)
-                call_id = tool.get("id", generate_completion_id())
+                call_id, name, arguments = _normalize_tool_use(tool)
                 tool_item = {
                     "id": f"fc_{call_id}",
                     "call_id": call_id,
-                    "name": tool.get("name", ""),
-                    "arguments": json.dumps(tool.get("input", {}), ensure_ascii=False),
+                    "name": name,
+                    "arguments": arguments,
                     "output_index": tool_output_index,
                 }
                 tool_items.append(tool_item)
                 current_tool_index = tool_output_index
+
+                logger.debug(
+                    f"[Responses Streaming] emitting function_call "
+                    f"name={name!r} id='fc_{call_id}' call_id={call_id!r} "
+                    f"arguments_length={len(arguments)}"
+                )
 
                 yield _sse("response.output_item.added", {
                     "type": "response.output_item.added",
@@ -310,15 +335,16 @@ async def collect_responses_response(
                 text_buffer += event.content or ""
             elif event.type == "tool_use":
                 tool = event.tool_use or {}
-                call_id = tool.get("id", generate_completion_id())
+                call_id, name, arguments = _normalize_tool_use(tool)
                 tool_items.append({
                     "type": "function_call",
                     "id": f"fc_{call_id}",
                     "call_id": call_id,
-                    "name": tool.get("name", ""),
-                    "arguments": json.dumps(tool.get("input", {}), ensure_ascii=False),
+                    "name": name,
+                    "arguments": arguments,
                     "status": "completed",
                 })
+                logger.debug(f"[Responses] collected function_call name={name!r} call_id={call_id!r}")
             elif event.type == "usage":
                 usage = event.usage or {}
                 input_tokens = usage.get("input_tokens", input_tokens)
