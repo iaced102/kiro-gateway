@@ -1,0 +1,239 @@
+# -*- coding: utf-8 -*-
+
+"""
+Converters for transforming OpenAI Responses API format to Kiro format.
+
+Converts Responses API input (string or item array) to the unified format
+used by converters_core.py.
+"""
+
+from typing import Any, Dict, List, Optional, Tuple
+
+from loguru import logger
+
+from kiro.config import HIDDEN_MODELS
+from kiro.model_resolver import get_model_id_for_kiro
+from kiro.models_responses import CreateResponseRequest
+
+from kiro.converters_core import (
+    extract_text_content,
+    extract_images_from_content,
+    UnifiedMessage,
+    UnifiedTool,
+    ThinkingConfig,
+    build_kiro_payload as core_build_kiro_payload,
+)
+from kiro.converters_openai import reasoning_effort_to_budget
+
+
+# ==================================================================================================
+# Input conversion
+# ==================================================================================================
+
+def _content_to_text(content: Any) -> str:
+    """Extract plain text from a Responses API content value."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("type", "")
+                if t in ("input_text", "output_text", "text"):
+                    parts.append(block.get("text", ""))
+                elif t == "refusal":
+                    parts.append(block.get("refusal", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return ""
+
+
+def _extract_images_from_response_content(content: Any) -> List[Dict[str, Any]]:
+    """Extract images from a Responses API content value."""
+    if not isinstance(content, list):
+        return []
+    openai_style = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "input_image":
+            url = block.get("image_url", "")
+            if url:
+                openai_style.append({"type": "image_url", "image_url": {"url": url}})
+    return extract_images_from_content(openai_style)
+
+
+def convert_responses_input_to_unified(
+    input_value: Any,
+    instructions: Optional[str],
+) -> Tuple[str, List[UnifiedMessage]]:
+    """
+    Convert Responses API input to (system_prompt, unified_messages).
+
+    input_value can be:
+    - str: treated as a single user message
+    - list of items: message / function_call / function_call_output objects
+    """
+    system_prompt = instructions or ""
+
+    # Plain string input → single user message
+    if isinstance(input_value, str):
+        return system_prompt, [UnifiedMessage(role="user", content=input_value)]
+
+    if not isinstance(input_value, list):
+        return system_prompt, []
+
+    unified: List[UnifiedMessage] = []
+    pending_tool_results: List[Dict[str, Any]] = []
+
+    def flush_tool_results():
+        if pending_tool_results:
+            unified.append(UnifiedMessage(
+                role="user",
+                content="",
+                tool_results=list(pending_tool_results),
+            ))
+            pending_tool_results.clear()
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type", "message")
+        role = item.get("role", "")
+
+        if item_type == "function_call_output":
+            # Tool result
+            pending_tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": item.get("call_id", ""),
+                "content": item.get("output", "") or "(empty result)",
+            })
+            continue
+
+        # For function_call or message items, flush any pending tool results first
+        flush_tool_results()
+
+        if item_type == "function_call":
+            # Assistant tool call
+            import json as _json
+            tool_calls = [{
+                "id": item.get("id") or item.get("call_id", ""),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", "{}"),
+                },
+            }]
+            unified.append(UnifiedMessage(
+                role="assistant",
+                content="",
+                tool_calls=tool_calls,
+            ))
+            continue
+
+        # message item
+        if item_type == "message" or role in ("user", "assistant", "system"):
+            content_raw = item.get("content", "")
+
+            if role == "system":
+                # Merge into system prompt
+                system_prompt = (system_prompt + "\n" + _content_to_text(content_raw)).strip()
+                continue
+
+            text = _content_to_text(content_raw)
+            images = _extract_images_from_response_content(content_raw) or None
+
+            # Check for output items inside assistant messages (e.g. nested function_call)
+            if role == "assistant" and isinstance(content_raw, list):
+                tool_calls = []
+                for block in content_raw:
+                    if isinstance(block, dict) and block.get("type") == "function_call":
+                        tool_calls.append({
+                            "id": block.get("id") or block.get("call_id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": block.get("arguments", "{}"),
+                            },
+                        })
+                if tool_calls:
+                    unified.append(UnifiedMessage(
+                        role="assistant",
+                        content=text,
+                        tool_calls=tool_calls or None,
+                        images=images,
+                    ))
+                    continue
+
+            unified.append(UnifiedMessage(
+                role=role or "user",
+                content=text,
+                images=images,
+            ))
+
+    flush_tool_results()
+    return system_prompt, unified
+
+
+def convert_responses_tools_to_unified(tools: Optional[List[Any]]) -> Optional[List[UnifiedTool]]:
+    """Convert Responses API tool definitions to unified format."""
+    if not tools:
+        return None
+
+    result = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        t = tool.get("type", "function")
+        if t != "function":
+            continue
+        result.append(UnifiedTool(
+            name=tool.get("name", ""),
+            description=tool.get("description"),
+            input_schema=tool.get("parameters"),
+        ))
+
+    return result or None
+
+
+def extract_thinking_config_from_responses(request: CreateResponseRequest) -> ThinkingConfig:
+    """Extract ThinkingConfig from a Responses API request."""
+    if not request.reasoning_effort:
+        return ThinkingConfig(enabled=True, budget_tokens=None)
+
+    if request.reasoning_effort == "none":
+        return ThinkingConfig(enabled=False, budget_tokens=None)
+
+    max_tokens = request.max_output_tokens or 4096
+    budget = reasoning_effort_to_budget(max_tokens, request.reasoning_effort)
+    return ThinkingConfig(enabled=True, budget_tokens=budget)
+
+
+def build_kiro_payload_from_responses(
+    request_data: CreateResponseRequest,
+    conversation_id: str,
+    profile_arn: str,
+) -> dict:
+    """Build Kiro API payload from a Responses API request."""
+    system_prompt, unified_messages = convert_responses_input_to_unified(
+        request_data.input, request_data.instructions
+    )
+    unified_tools = convert_responses_tools_to_unified(request_data.tools)
+    model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
+    thinking_config = extract_thinking_config_from_responses(request_data)
+
+    logger.debug(
+        f"Converting Responses request: model={request_data.model} -> {model_id}, "
+        f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}"
+    )
+
+    result = core_build_kiro_payload(
+        messages=unified_messages,
+        system_prompt=system_prompt,
+        model_id=model_id,
+        tools=unified_tools,
+        conversation_id=conversation_id,
+        profile_arn=profile_arn,
+        thinking_config=thinking_config,
+    )
+    return result.payload
