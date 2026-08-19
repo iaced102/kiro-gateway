@@ -901,3 +901,136 @@ class TestDeveloperMessageToolResultAdjacency:
         }
         assert "id1" in all_tr_ids, "Tool result id1 lost"
         assert "id2" in all_tr_ids, "Tool result id2 lost"
+
+
+class TestToolUseResultPipelineOrdering:
+    """
+    Regression tests for TOOL_USE_RESULT_MISMATCH caused by
+    ensure_assistant_before_tool_results running before merge_adjacent_messages.
+
+    Root cause: Codex can produce:
+      function_call(id1) → assistant("text") → function_call_output(id1)
+    which the input converter turns into:
+      [0] assistant(tool_calls=[id1])
+      [1] assistant(content="text")   <- no tool_calls
+      [2] user(tool_results=[id1])
+    If ensure_assistant_before_tool_results runs first, result[-1] is msg[1]
+    (plain assistant, no tool_calls) → id1 classified as orphan → converted to text.
+    The fix: merge adjacent messages BEFORE orphan detection.
+    """
+
+    def _build_payload(self, msgs, tools=None):
+        """Build a minimal Kiro payload from unified messages for inspection."""
+        from kiro.converters_core import (
+            build_kiro_payload, UnifiedMessage, UnifiedTool, ThinkingConfig
+        )
+        from unittest.mock import patch
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            result = build_kiro_payload(
+                messages=msgs,
+                system_prompt="",
+                model_id="test-model",
+                tools=tools,
+                conversation_id="test-conv",
+                profile_arn="",
+                thinking_config=ThinkingConfig(enabled=False),
+            )
+        return result.payload
+
+    def test_interleaved_assistant_text_does_not_orphan_tool_result(self):
+        """
+        assistant(tool_use=id1) + assistant("text") + user(tool_result=id1)
+        After merge, the pair must survive as structured toolUse/toolResult.
+        """
+        from kiro.converters_core import UnifiedMessage, UnifiedTool
+        msgs = [
+            UnifiedMessage(role="user", content="go"),
+            UnifiedMessage(
+                role="assistant", content="",
+                tool_calls=[{"id": "id1", "type": "function",
+                             "function": {"name": "exec_command", "arguments": "{}"}}]),
+            UnifiedMessage(role="assistant", content="working on it"),
+            UnifiedMessage(
+                role="user", content="",
+                tool_results=[{"type": "tool_result", "tool_use_id": "id1",
+                               "content": "/workspace"}]),
+            UnifiedMessage(role="user", content="continue"),
+        ]
+        tools = [UnifiedTool(name="exec_command", description="d",
+                             input_schema={"type": "object", "properties": {}})]
+        payload = self._build_payload(msgs, tools)
+        history = payload["conversationState"]["history"]
+        # Find the assistant entry that has toolUses
+        tool_use_found = any(
+            "assistantResponseMessage" in e and
+            any(tu.get("toolUseId") == "id1"
+                for tu in e["assistantResponseMessage"].get("toolUses", []))
+            for e in history
+        )
+        tool_result_found = any(
+            "userInputMessage" in e and
+            any(tr.get("toolUseId") == "id1"
+                for tr in e["userInputMessage"]
+                    .get("userInputMessageContext", {})
+                    .get("toolResults", []))
+            for e in history
+        ) or any(
+            tr.get("toolUseId") == "id1"
+            for tr in payload["conversationState"]["currentMessage"]
+                ["userInputMessage"]
+                .get("userInputMessageContext", {})
+                .get("toolResults", [])
+        )
+        assert tool_use_found, "toolUse id1 not found in Kiro history"
+        assert tool_result_found, "toolResult id1 not found in Kiro history"
+
+    def test_valid_tool_pair_adjacent_in_kiro_history(self):
+        """
+        After normalization, each assistantResponseMessage with toolUses must be
+        followed by a userInputMessage containing the matching toolResults — either
+        as the next history entry or as currentMessage (when the tool result is the
+        final user turn).
+        """
+        from kiro.converters_core import UnifiedMessage, UnifiedTool
+        msgs = [
+            UnifiedMessage(role="user", content="prompt"),
+            UnifiedMessage(
+                role="assistant", content="",
+                tool_calls=[{"id": "tid", "type": "function",
+                             "function": {"name": "my_tool", "arguments": "{}"}}]),
+            UnifiedMessage(role="assistant", content="thinking..."),
+            UnifiedMessage(
+                role="user", content="",
+                tool_results=[{"type": "tool_result", "tool_use_id": "tid",
+                               "content": "result"}]),
+            UnifiedMessage(role="user", content="next"),
+        ]
+        tools = [UnifiedTool(name="my_tool", description="d",
+                             input_schema={"type": "object", "properties": {}})]
+        payload = self._build_payload(msgs, tools)
+        history = payload["conversationState"]["history"]
+        current_msg = payload["conversationState"].get("currentMessage", {})
+
+        def _get_result_ids(user_entry):
+            return {
+                tr["toolUseId"]
+                for tr in user_entry.get("userInputMessage", {})
+                    .get("userInputMessageContext", {})
+                    .get("toolResults", [])
+            }
+
+        for i, entry in enumerate(history):
+            if "assistantResponseMessage" not in entry:
+                continue
+            uses = entry["assistantResponseMessage"].get("toolUses", [])
+            if not uses:
+                continue
+            use_ids = {u["toolUseId"] for u in uses}
+            # Tool results may be in the next history entry or in currentMessage
+            next_entry = history[i + 1] if i + 1 < len(history) else None
+            if next_entry is not None and "userInputMessage" in next_entry:
+                result_ids = _get_result_ids(next_entry)
+            else:
+                result_ids = _get_result_ids(current_msg)
+            assert use_ids <= result_ids, \
+                f"toolUse IDs {use_ids} not matched by toolResult IDs {result_ids}"

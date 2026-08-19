@@ -1460,11 +1460,21 @@ def build_kiro_payload(
         messages_with_assistants = messages_without_tools
         converted_tool_results = had_tool_content
     else:
+        # Merge adjacent same-role messages FIRST so that an assistant message
+        # immediately following a tool-calling assistant (e.g. Codex pattern:
+        # function_call → assistant("text") → function_call_output) is consolidated
+        # into a single assistant message with tool_calls before orphan detection runs.
+        # If we ran ensure_assistant_before_tool_results first, it would see the
+        # intervening plain-assistant as result[-1] (no tool_calls) and wrongly
+        # degrade the valid tool result to text (TOOL_USE_RESULT_MISMATCH).
+        pre_merged = merge_adjacent_messages(messages)
+
         # Ensure assistant messages exist before tool_results (Kiro API requirement)
         # Also returns flag if any tool_results were converted (to skip thinking tag injection)
-        messages_with_assistants, converted_tool_results = ensure_assistant_before_tool_results(messages)
-    
-    # Merge adjacent messages with the same role
+        messages_with_assistants, converted_tool_results = ensure_assistant_before_tool_results(pre_merged)
+
+    # Merge adjacent messages again to handle any new adjacency introduced by the
+    # orphan-detection step (e.g. a synthetic user message adjacent to a real one).
     merged_messages = merge_adjacent_messages(messages_with_assistants)
     
     # Ensure first message is from user (Kiro API requirement, fixes issue #60)
