@@ -300,26 +300,66 @@ def convert_responses_tools_to_unified(
         name = tool.get("name", "")
 
         if t == "function":
+            params = tool.get("parameters")
+            if not isinstance(params, dict):
+                params = {"type": "object", "properties": {}}
             result.append(UnifiedTool(
                 name=name,
                 description=tool.get("description"),
-                input_schema=tool.get("parameters"),
-            ))
-        elif t == "namespace":
-            # Codex uses "namespace" as a callable tool group (e.g. the local shell
-            # namespace).  Map it to a plain function tool so that any function_call
-            # items referencing it remain valid in Kiro history.
-            params = (
-                tool.get("parameters")
-                or tool.get("input_schema")
-                or tool.get("schema")
-            )
-            result.append(UnifiedTool(
-                name=name,
-                description=tool.get("description") or f"Namespace: {name}",
                 input_schema=params,
             ))
-            logger.debug(f"Mapped namespace tool '{name}' to function tool")
+        elif t == "namespace":
+            # Codex namespace is a container — flatten its child function tools.
+            # The namespace itself is NOT callable and has no valid input schema.
+            nested_tools = tool.get("tools") or []
+            logger.debug(
+                f"[Responses] namespace raw={tool!r}"
+            )
+            logger.debug(
+                f"[Responses] namespace '{name}': flattening {len(nested_tools)} nested tools"
+            )
+            flattened_count = 0
+            for nested in nested_tools:
+                if not isinstance(nested, dict):
+                    continue
+                nested_type = nested.get("type", "function")
+                nested_name = nested.get("name", "")
+                if nested_type != "function":
+                    logger.debug(
+                        f"[Responses] Skipping non-function namespace member "
+                        f"type='{nested_type}' name='{nested_name}' in namespace '{name}'"
+                    )
+                    continue
+                if not nested_name:
+                    logger.warning(
+                        f"[Responses] Skipping namespace member with empty name in namespace '{name}'"
+                    )
+                    continue
+                params = (
+                    nested.get("parameters")
+                    or nested.get("input_schema")
+                    or nested.get("schema")
+                )
+                if not isinstance(params, dict):
+                    params = {"type": "object", "properties": {}}
+                result.append(UnifiedTool(
+                    name=nested_name,
+                    description=nested.get("description") or f"Tool: {nested_name}",
+                    input_schema=params,
+                ))
+                logger.debug(
+                    f"[Responses] Flattened namespace '{name}' -> tool '{nested_name}'"
+                )
+                flattened_count += 1
+            if flattened_count == 0:
+                # No callable children — treat like an unsupported tool so that
+                # any function_call items referencing this namespace name are dropped.
+                logger.debug(
+                    f"[Responses] Namespace '{name}' has no callable tools — "
+                    f"adding to dropped_names"
+                )
+                if name:
+                    dropped_names.add(name)
         else:
             # Hosted tools (web_search, computer_use_preview, …) are not supported
             # by Kiro.  Record the name so the input converter can drop any
@@ -382,6 +422,36 @@ def _log_kiro_payload_summary(payload: dict) -> None:
         logger.debug("\n".join(lines))
     except Exception:
         pass
+
+
+def _validate_kiro_tools(payload: dict) -> None:
+    """Validate all Kiro tool schemas before sending to Bedrock.
+
+    Raises ValueError if any toolSpecification.inputSchema.json.type != 'object'.
+    """
+    conv = payload.get("conversationState", {})
+    current = conv.get("currentMessage", {})
+    uim = current.get("userInputMessage", {})
+    ctx = uim.get("userInputMessageContext", {})
+    tools = ctx.get("tools", [])
+    errors = []
+    for i, tool in enumerate(tools):
+        spec = tool.get("toolSpecification", {})
+        tname = spec.get("name", "?")
+        schema = spec.get("inputSchema", {}).get("json", {})
+        schema_type = schema.get("type") if isinstance(schema, dict) else None
+        logger.debug(
+            f"[Responses] Kiro tool index={i} name={tname!r} schema_type={schema_type!r}"
+        )
+        if schema_type != "object":
+            errors.append(
+                f"index={i} name={tname!r} schema_type={schema_type!r}"
+            )
+    if errors:
+        raise ValueError(
+            "Invalid Kiro tool schema(s) — Bedrock requires type='object':\n" +
+            "\n".join(f"  {e}" for e in errors)
+        )
 
 
 def _validate_kiro_tool_consistency(payload: dict) -> None:
@@ -503,6 +573,9 @@ def build_kiro_payload_from_responses(
 
     # Compact DEBUG summary of what will be sent to Kiro
     _log_kiro_payload_summary(result.payload)
+
+    # Validate tool schemas — raises ValueError (→ HTTP 400) if any schema type != object
+    _validate_kiro_tools(result.payload)
 
     # Validate tool use / result consistency — raises ValueError (→ HTTP 400) on mismatch
     _validate_kiro_tool_consistency(result.payload)

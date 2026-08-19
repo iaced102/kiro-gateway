@@ -35,17 +35,19 @@ class TestConvertResponsesToolsToUnified:
         assert result[0].name == "my_func"
         assert dropped == set()
 
-    def test_namespace_tool_mapped_to_function(self):
+    def test_namespace_no_children_is_dropped(self):
+        # Namespace with no child tools has no callable members — dropped
         tools = [{"type": "namespace", "name": "shell", "description": "Local shell"}]
         result, dropped = convert_responses_tools_to_unified(tools)
-        assert len(result) == 1
-        assert result[0].name == "shell"
-        assert dropped == set()
+        assert result is None
+        assert "shell" in dropped
 
-    def test_namespace_without_description_gets_placeholder(self):
+    def test_namespace_no_tools_key_is_dropped(self):
+        # Namespace with no 'tools' key at all — no callable members, dropped
         tools = [{"type": "namespace", "name": "shell"}]
         result, dropped = convert_responses_tools_to_unified(tools)
-        assert result[0].description == "Namespace: shell"
+        assert result is None
+        assert "shell" in dropped
 
     def test_web_search_dropped_and_name_recorded(self):
         tools = [{"type": "web_search", "name": "web_search"}]
@@ -60,16 +62,18 @@ class TestConvertResponsesToolsToUnified:
         assert dropped == set()  # no name -> nothing to track
 
     def test_mixed_tools(self):
+        # namespace 'shell' has no child tools -> dropped alongside web_search
         tools = [
             {"type": "function", "name": "get_weather"},
             {"type": "namespace", "name": "shell"},
             {"type": "web_search", "name": "web_search"},
         ]
         result, dropped = convert_responses_tools_to_unified(tools)
-        assert len(result) == 2
+        assert len(result) == 1
         names = {t.name for t in result}
-        assert names == {"get_weather", "shell"}
-        assert dropped == {"web_search"}
+        assert names == {"get_weather"}
+        assert "web_search" in dropped
+        assert "shell" in dropped
 
     def test_empty_list(self):
         result, dropped = convert_responses_tools_to_unified([])
@@ -345,6 +349,7 @@ class TestFullRoundTripConsistency:
         assert self._referenced_names(msgs) <= self._tool_names(unified_tools)
 
     def test_namespace_and_function_tools(self):
+        # namespace 'shell' has no child tools -> dropped; shell function_call is dropped too
         tools_raw = [
             {"type": "function", "name": "read_file", "description": "d"},
             {"type": "namespace", "name": "shell"},
@@ -356,8 +361,12 @@ class TestFullRoundTripConsistency:
             {"type": "function_call_output", "call_id": "r1", "output": "contents"},
         ]
         unified_tools, dropped = convert_responses_tools_to_unified(tools_raw)
+        assert "shell" in dropped
         _, msgs = convert_responses_input_to_unified(inp, None, dropped)
+        # shell call dropped; only read_file survives
         assert self._referenced_names(msgs) <= self._tool_names(unified_tools)
+        assert "shell" not in self._referenced_names(msgs)
+        assert "read_file" in self._referenced_names(msgs)
 
     def test_web_search_removed_from_both_sides(self):
         tools_raw = [
@@ -720,3 +729,94 @@ class TestMultiTurnReplay:
         assert msgs[0].tool_calls[0]["id"] == "tooluse_999"
         # tool_result must reference the same id
         assert msgs[1].tool_results[0]["tool_use_id"] == "tooluse_999"
+
+
+# ==================================================================================================
+# Namespace tool flattening — Bedrock TOOL_SCHEMA_INVALID fix
+# ==================================================================================================
+
+class TestNamespaceToolFlattening:
+
+    def test_namespace_container_not_emitted_as_tool(self):
+        tools = [{"type": "namespace", "name": "multi_agent_v1", "tools": [
+            {"type": "function", "name": "spawn_agent", "description": "Spawn",
+             "parameters": {"type": "object", "properties": {}}}
+        ]}]
+        result, dropped = convert_responses_tools_to_unified(tools)
+        names = {t.name for t in result}
+        assert "multi_agent_v1" not in names
+
+    def test_namespace_function_member_flattened(self):
+        tools = [{"type": "namespace", "name": "multi_agent_v1", "tools": [
+            {"type": "function", "name": "spawn_agent", "description": "Spawn",
+             "parameters": {"type": "object", "properties": {"task": {"type": "string"}}}}
+        ]}]
+        result, dropped = convert_responses_tools_to_unified(tools)
+        assert len(result) == 1
+        assert result[0].name == "spawn_agent"
+        assert result[0].input_schema["type"] == "object"
+
+    def test_namespace_function_schema_is_object(self):
+        tools = [{"type": "namespace", "name": "ns", "tools": [
+            {"type": "function", "name": "do_thing"}
+        ]}]
+        result, dropped = convert_responses_tools_to_unified(tools)
+        assert result[0].input_schema.get("type") == "object"
+
+    def test_namespace_custom_member_skipped(self):
+        tools = [{"type": "namespace", "name": "ns", "tools": [
+            {"type": "custom", "name": "freeform"},
+            {"type": "function", "name": "valid_func", "parameters": {"type": "object", "properties": {}}}
+        ]}]
+        result, dropped = convert_responses_tools_to_unified(tools)
+        names = {t.name for t in result}
+        assert "freeform" not in names
+        assert "valid_func" in names
+
+    def test_multiple_namespaces_all_flattened(self):
+        tools = [
+            {"type": "namespace", "name": "ns_a", "tools": [
+                {"type": "function", "name": "tool_a", "parameters": {"type": "object", "properties": {}}}
+            ]},
+            {"type": "namespace", "name": "ns_b", "tools": [
+                {"type": "function", "name": "tool_b", "parameters": {"type": "object", "properties": {}}}
+            ]},
+        ]
+        result, dropped = convert_responses_tools_to_unified(tools)
+        names = {t.name for t in result}
+        assert names == {"tool_a", "tool_b"}
+        assert "ns_a" not in names
+        assert "ns_b" not in names
+
+    def test_function_tool_missing_schema_gets_default(self):
+        tools = [{"type": "function", "name": "no_params"}]
+        result, dropped = convert_responses_tools_to_unified(tools)
+        assert result[0].input_schema["type"] == "object"
+
+    def test_empty_namespace_tools_list(self):
+        tools = [{"type": "namespace", "name": "empty_ns", "tools": []}]
+        result, dropped = convert_responses_tools_to_unified(tools)
+        assert result is None
+
+    def test_namespace_function_call_resolves_to_flattened_name(self):
+        tools = [{"type": "namespace", "name": "multi_agent_v1", "tools": [
+            {"type": "function", "name": "spawn_agent", "parameters": {"type": "object", "properties": {}}}
+        ]}]
+        unified_tools, dropped = convert_responses_tools_to_unified(tools)
+        tool_names = {t.name for t in unified_tools}
+
+        inp = [
+            {"type": "function_call", "id": "fc_1", "call_id": "id_1", "name": "spawn_agent", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "id_1", "output": "done"},
+        ]
+        _, msgs = convert_responses_input_to_unified(inp, None, dropped)
+        names = [tc["function"]["name"] for m in msgs if m.tool_calls for tc in m.tool_calls]
+        assert "spawn_agent" in names
+        assert "spawn_agent" in tool_names
+
+    def test_old_round_trip_namespace_no_tools_field(self):
+        """A namespace with no 'tools' key (old style) produces nothing, not an invalid tool."""
+        tools = [{"type": "namespace", "name": "shell"}]
+        result, dropped = convert_responses_tools_to_unified(tools)
+        # Empty namespace — no child tools to flatten
+        assert result is None
