@@ -94,12 +94,34 @@ def convert_responses_input_to_unified(
             ))
             pending_tool_results.clear()
 
+    # Item types produced by built-in hosted tools that Kiro doesn't support.
+    # We skip them entirely rather than letting them corrupt the conversation structure.
+    _SKIP_ITEM_TYPES = frozenset({
+        "reasoning",          # thinking/reasoning blocks
+        "computer_call",      # computer-use action
+        "computer_call_output",
+        "web_search_call",    # web search action
+        "web_search_call_output",
+        "image_generation_call",
+        "image_generation_call_output",
+        "code_interpreter_call",
+        "code_interpreter_call_output",
+        "file_search_call",
+        "file_search_call_output",
+        "mcp_call",
+        "mcp_call_output",
+    })
+
     for item in input_value:
         if not isinstance(item, dict):
             continue
 
         item_type = item.get("type", "message")
         role = item.get("role", "")
+
+        if item_type in _SKIP_ITEM_TYPES:
+            logger.debug(f"Skipping unsupported Responses input item type '{item_type}'")
+            continue
 
         if item_type == "function_call_output":
             # Tool result
@@ -115,7 +137,6 @@ def convert_responses_input_to_unified(
 
         if item_type == "function_call":
             # Assistant tool call
-            import json as _json
             tool_calls = [{
                 "id": item.get("id") or item.get("call_id", ""),
                 "type": "function",
@@ -186,6 +207,9 @@ def convert_responses_tools_to_unified(tools: Optional[List[Any]]) -> Optional[L
             continue
         t = tool.get("type", "function")
         if t != "function":
+            # Built-in hosted tools (web_search_preview, computer_use_preview, etc.)
+            # are not supported by Kiro — skip them silently.
+            logger.debug(f"Skipping non-function tool type '{t}' (not supported by Kiro)")
             continue
         result.append(UnifiedTool(
             name=tool.get("name", ""),
@@ -215,6 +239,25 @@ def build_kiro_payload_from_responses(
     profile_arn: str,
 ) -> dict:
     """Build Kiro API payload from a Responses API request."""
+    import json as _json
+
+    # Debug: log the raw incoming Responses request fields relevant to conversion
+    if logger.level("DEBUG").no >= 0:
+        raw_tools = request_data.tools or []
+        tool_summary = [
+            {"type": t.get("type", "?"), "name": t.get("name", "")}
+            for t in raw_tools if isinstance(t, dict)
+        ]
+        raw_input = request_data.input
+        input_types = (
+            [i.get("type", i.get("role", "?")) for i in raw_input if isinstance(i, dict)]
+            if isinstance(raw_input, list) else type(raw_input).__name__
+        )
+        logger.debug(
+            f"[Responses] incoming: model={request_data.model}, "
+            f"input_item_types={input_types}, tools={tool_summary}"
+        )
+
     system_prompt, unified_messages = convert_responses_input_to_unified(
         request_data.input, request_data.instructions
     )
@@ -223,8 +266,8 @@ def build_kiro_payload_from_responses(
     thinking_config = extract_thinking_config_from_responses(request_data)
 
     logger.debug(
-        f"Converting Responses request: model={request_data.model} -> {model_id}, "
-        f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}"
+        f"[Responses] converting: model={request_data.model} -> {model_id}, "
+        f"unified_messages={len(unified_messages)}, unified_tools={len(unified_tools) if unified_tools else 0}"
     )
 
     result = core_build_kiro_payload(
@@ -236,4 +279,12 @@ def build_kiro_payload_from_responses(
         profile_arn=profile_arn,
         thinking_config=thinking_config,
     )
+
+    # Debug: log the generated Kiro payload (truncated for readability)
+    try:
+        payload_str = _json.dumps(result.payload, ensure_ascii=False)
+        logger.debug(f"[Responses] kiro payload ({len(payload_str)} bytes): {payload_str[:2000]}")
+    except Exception:
+        pass
+
     return result.payload
