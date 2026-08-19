@@ -224,6 +224,24 @@ def convert_responses_input_to_unified(
                 system_prompt = (system_prompt + "\n" + _content_to_text(content_raw)).strip()
                 continue
 
+            if role not in ("user", "assistant") and pending_tool_results:
+                # Non-user non-assistant roles (e.g. "developer") arrive between a
+                # function_call and its tool result user message.  If we let
+                # pending_tool_results wait, ensure_assistant_before_tool_results
+                # will see the developer message as result[-1] (not an assistant with
+                # tool_calls) and wrongly degrade the valid tool result to text.
+                # Flush now, exactly as the system branch does.
+                logger.debug(
+                    f"[Responses] Flushing {len(pending_tool_results)} pending tool result(s) "
+                    f"before role='{role}' message to preserve tool-use/result adjacency"
+                )
+                unified.append(UnifiedMessage(
+                    role="user",
+                    content="",
+                    tool_results=list(pending_tool_results),
+                ))
+                pending_tool_results.clear()
+
             text = _content_to_text(content_raw)
             images = _extract_images_from_response_content(content_raw) or None
 

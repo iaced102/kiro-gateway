@@ -820,3 +820,84 @@ class TestNamespaceToolFlattening:
         result, dropped = convert_responses_tools_to_unified(tools)
         # Empty namespace — no child tools to flatten
         assert result is None
+
+
+class TestDeveloperMessageToolResultAdjacency:
+    """
+    Regression tests for TOOL_USE_RESULT_MISMATCH caused by developer messages
+    inserted between a function_call and its matching function_call_output.
+
+    Root cause: pending_tool_results were not flushed before role='developer'
+    messages, so ensure_assistant_before_tool_results saw the developer message
+    as result[-1] (not an assistant with tool_calls) and converted valid tool
+    results to text — destroying the toolUse/toolResult pair.
+    """
+
+    def test_tool_result_not_converted_to_text_after_developer_message(self):
+        """
+        function_call → function_call_output → developer → user
+        The tool result must remain structured, not degraded to text.
+        """
+        inp = [
+            {"type": "function_call", "id": "fc1", "call_id": "id1",
+             "name": "exec_command", "arguments": '{"cmd": "pwd"}'},
+            {"type": "function_call_output", "call_id": "id1", "output": "/workspace"},
+            {"type": "message", "role": "developer", "content": "extra context"},
+            {"type": "message", "role": "user", "content": "continue"},
+        ]
+        sys, msgs = convert_responses_input_to_unified(inp, None)
+        # Structured tool result must survive
+        all_results = [
+            tr for m in msgs if m.tool_results for tr in m.tool_results
+        ]
+        assert any(tr["tool_use_id"] == "id1" for tr in all_results), (
+            "Tool result id1 was converted to text instead of kept structured"
+        )
+
+    def test_tool_use_immediately_followed_by_tool_result(self):
+        """
+        After pipeline normalization, assistant(tool_use=id1) must be
+        immediately followed by user(tool_result=id1).
+        """
+        inp = [
+            {"type": "function_call", "id": "fc1", "call_id": "id1",
+             "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "id1", "output": "done"},
+            {"type": "message", "role": "developer", "content": "dev note"},
+            {"type": "message", "role": "user", "content": "next"},
+        ]
+        sys, msgs = convert_responses_input_to_unified(inp, None)
+        # Find the assistant with tool_calls
+        for i, m in enumerate(msgs):
+            if m.tool_calls and any(tc["id"] == "id1" for tc in m.tool_calls):
+                # The very next message must contain the matching tool result
+                assert i + 1 < len(msgs), "No message after assistant tool_call"
+                next_msg = msgs[i + 1]
+                assert next_msg.tool_results, "Next message has no tool_results"
+                ids = [tr["tool_use_id"] for tr in next_msg.tool_results]
+                assert "id1" in ids, f"Expected id1 in tool_results, got {ids}"
+                return
+        pytest.fail("No assistant message with tool_call id1 found")
+
+    def test_multiple_tool_calls_with_developer_messages_interleaved(self):
+        """
+        Two tool calls separated by a developer message — both results preserved.
+        """
+        inp = [
+            {"type": "function_call", "id": "fc1", "call_id": "id1",
+             "name": "tool_a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "id1", "output": "a_result"},
+            {"type": "message", "role": "developer", "content": "dev1"},
+            {"type": "function_call", "id": "fc2", "call_id": "id2",
+             "name": "tool_b", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "id2", "output": "b_result"},
+            {"type": "message", "role": "user", "content": "done"},
+        ]
+        sys, msgs = convert_responses_input_to_unified(inp, None)
+        all_tr_ids = {
+            tr["tool_use_id"]
+            for m in msgs if m.tool_results
+            for tr in m.tool_results
+        }
+        assert "id1" in all_tr_ids, "Tool result id1 lost"
+        assert "id2" in all_tr_ids, "Tool result id2 lost"
