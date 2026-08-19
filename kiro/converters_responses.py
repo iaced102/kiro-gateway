@@ -65,6 +65,7 @@ def _extract_images_from_response_content(content: Any) -> List[Dict[str, Any]]:
 def convert_responses_input_to_unified(
     input_value: Any,
     instructions: Optional[str],
+    dropped_tool_names: Optional[set] = None,
 ) -> Tuple[str, List[UnifiedMessage]]:
     """
     Convert Responses API input to (system_prompt, unified_messages).
@@ -72,8 +73,14 @@ def convert_responses_input_to_unified(
     input_value can be:
     - str: treated as a single user message
     - list of items: message / function_call / function_call_output objects
+
+    dropped_tool_names: set of tool names whose definitions were skipped (e.g. hosted
+    tools like web_search).  Any function_call item whose name is in this set is
+    silently dropped together with its matching function_call_output items, so that
+    Kiro history never references a tool that was not forwarded as a toolSpecification.
     """
     system_prompt = instructions or ""
+    _dropped = dropped_tool_names or set()
 
     # Plain string input → single user message
     if isinstance(input_value, str):
@@ -87,6 +94,11 @@ def convert_responses_input_to_unified(
     # Flushing as a standalone empty-user message would create two consecutive user
     # messages that merge_adjacent_messages collapses incorrectly for multi-turn threads.
     pending_tool_results: List[Dict[str, Any]] = []
+
+    # call_ids whose function_call was dropped because the tool definition was skipped.
+    # The matching function_call_output items must also be dropped to keep history
+    # consistent (Kiro validates tool-use ↔ tool-result pairing).
+    dropped_call_ids: set = set()
 
     # Item types produced by built-in hosted tools that Kiro doesn't support.
     # Defined once outside the loop.
@@ -118,15 +130,36 @@ def convert_responses_input_to_unified(
             continue
 
         if item_type == "function_call_output":
+            call_id = item.get("call_id", "")
+            if call_id in dropped_call_ids:
+                logger.debug(
+                    f"Dropping function_call_output call_id='{call_id}' "
+                    f"(matching function_call was dropped)"
+                )
+                continue
             # Accumulate tool results; they will be attached to the next user message.
             pending_tool_results.append({
                 "type": "tool_result",
-                "tool_use_id": item.get("call_id", ""),
+                "tool_use_id": call_id,
                 "content": item.get("output", "") or "(empty result)",
             })
             continue
 
         if item_type == "function_call":
+            fc_name = item.get("name", "")
+            fc_id = item.get("id") or item.get("call_id", "")
+
+            if fc_name in _dropped:
+                # The tool definition was skipped (e.g. web_search hosted tool).
+                # Record the call_id so the matching function_call_output is also
+                # dropped — an orphaned tool result would cause REQUEST_BODY_INVALID.
+                dropped_call_ids.add(fc_id)
+                logger.debug(
+                    f"Dropping function_call name='{fc_name}' id='{fc_id}' "
+                    f"(tool definition was skipped)"
+                )
+                continue
+
             # Pending tool results before a new function_call mean a multi-step tool
             # chain where no user message arrived between calls.  Attach them to a
             # synthetic user message so Kiro history stays valid.
@@ -139,10 +172,10 @@ def convert_responses_input_to_unified(
                 pending_tool_results.clear()
 
             tool_calls = [{
-                "id": item.get("id") or item.get("call_id", ""),
+                "id": fc_id,
                 "type": "function",
                 "function": {
-                    "name": item.get("name", ""),
+                    "name": fc_name,
                     "arguments": item.get("arguments", "{}"),
                 },
             }]
@@ -223,28 +256,110 @@ def convert_responses_input_to_unified(
     return system_prompt, unified
 
 
-def convert_responses_tools_to_unified(tools: Optional[List[Any]]) -> Optional[List[UnifiedTool]]:
-    """Convert Responses API tool definitions to unified format."""
+def convert_responses_tools_to_unified(
+    tools: Optional[List[Any]],
+) -> tuple:
+    """Convert Responses API tool definitions to unified format.
+
+    Returns (unified_tools_or_None, dropped_tool_names) where dropped_tool_names
+    is the set of tool names whose definitions were skipped so callers can strip
+    any history items that reference them.
+    """
     if not tools:
-        return None
+        return None, set()
 
     result = []
+    dropped_names: set = set()
+
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         t = tool.get("type", "function")
-        if t != "function":
-            # Built-in hosted tools (web_search_preview, computer_use_preview, etc.)
-            # are not supported by Kiro — skip them silently.
-            logger.debug(f"Skipping non-function tool type '{t}' (not supported by Kiro)")
-            continue
-        result.append(UnifiedTool(
-            name=tool.get("name", ""),
-            description=tool.get("description"),
-            input_schema=tool.get("parameters"),
-        ))
+        name = tool.get("name", "")
 
-    return result or None
+        if t == "function":
+            result.append(UnifiedTool(
+                name=name,
+                description=tool.get("description"),
+                input_schema=tool.get("parameters"),
+            ))
+        elif t == "namespace":
+            # Codex uses "namespace" as a callable tool group (e.g. the local shell
+            # namespace).  Map it to a plain function tool so that any function_call
+            # items referencing it remain valid in Kiro history.
+            params = (
+                tool.get("parameters")
+                or tool.get("input_schema")
+                or tool.get("schema")
+            )
+            result.append(UnifiedTool(
+                name=name,
+                description=tool.get("description") or f"Namespace: {name}",
+                input_schema=params,
+            ))
+            logger.debug(f"Mapped namespace tool '{name}' to function tool")
+        else:
+            # Hosted tools (web_search, computer_use_preview, …) are not supported
+            # by Kiro.  Record the name so the input converter can drop any
+            # function_call / function_call_output items that reference it.
+            logger.debug(
+                f"Skipping unsupported tool type '{t}' (name='{name}')"
+            )
+            if name:
+                dropped_names.add(name)
+
+    return result or None, dropped_names
+
+
+def _log_kiro_payload_summary(payload: dict) -> None:
+    """Emit a compact DEBUG summary of the Kiro payload about to be sent."""
+    try:
+        conv = payload.get("conversationState", {})
+        history = conv.get("history", [])
+        current = conv.get("currentMessage", {})
+        uim = current.get("userInputMessage", {})
+        ctx = uim.get("userInputMessageContext", {})
+        available_tools = [
+            t.get("toolSpecification", {}).get("name", "?")
+            for t in ctx.get("tools", [])
+        ]
+
+        lines = ["[Responses] kiro payload summary:", "history:"]
+        for i, entry in enumerate(history):
+            if "userInputMessage" in entry:
+                m = entry["userInputMessage"]
+                tr_ids = [
+                    r.get("toolUseId", "?")
+                    for r in m.get("userInputMessageContext", {}).get("toolResults", [])
+                ]
+                suffix = f" tool_results={tr_ids}" if tr_ids else ""
+                lines.append(f"  {i} user{suffix}")
+            elif "assistantResponseMessage" in entry:
+                m = entry["assistantResponseMessage"]
+                tu_names = [
+                    f"{u.get('name', '?')}:{u.get('toolUseId', '?')}"
+                    for u in m.get("toolUses", [])
+                ]
+                suffix = f" tool_use={tu_names}" if tu_names else ""
+                lines.append(f"  {i} assistant{suffix}")
+
+        cur_tr_ids = [
+            r.get("toolUseId", "?")
+            for r in ctx.get("toolResults", [])
+        ]
+        suffix = f" tool_results={cur_tr_ids}" if cur_tr_ids else ""
+        lines.append(f"  {len(history)} user (current){suffix}")
+
+        if available_tools:
+            lines.append("available_tools:")
+            for name in available_tools:
+                lines.append(f"  - {name}")
+        else:
+            lines.append("available_tools: (none)")
+
+        logger.debug("\n".join(lines))
+    except Exception:
+        pass
 
 
 def extract_thinking_config_from_responses(request: CreateResponseRequest) -> ThinkingConfig:
@@ -266,8 +381,6 @@ def build_kiro_payload_from_responses(
     profile_arn: str,
 ) -> dict:
     """Build Kiro API payload from a Responses API request."""
-    import json as _json
-
     # Debug: log the raw incoming Responses request fields relevant to conversion
     if logger.level("DEBUG").no >= 0:
         raw_tools = request_data.tools or []
@@ -285,16 +398,19 @@ def build_kiro_payload_from_responses(
             f"input_item_types={input_types}, tools={tool_summary}"
         )
 
+    # Convert tools first so we know which names were dropped before processing input.
+    unified_tools, dropped_tool_names = convert_responses_tools_to_unified(request_data.tools)
+
     system_prompt, unified_messages = convert_responses_input_to_unified(
-        request_data.input, request_data.instructions
+        request_data.input, request_data.instructions, dropped_tool_names
     )
-    unified_tools = convert_responses_tools_to_unified(request_data.tools)
     model_id = get_model_id_for_kiro(request_data.model, HIDDEN_MODELS)
     thinking_config = extract_thinking_config_from_responses(request_data)
 
     logger.debug(
         f"[Responses] converting: model={request_data.model} -> {model_id}, "
-        f"unified_messages={len(unified_messages)}, unified_tools={len(unified_tools) if unified_tools else 0}"
+        f"unified_messages={len(unified_messages)}, unified_tools={len(unified_tools) if unified_tools else 0}, "
+        f"dropped_tools={sorted(dropped_tool_names) if dropped_tool_names else []}"
     )
 
     result = core_build_kiro_payload(
@@ -307,11 +423,7 @@ def build_kiro_payload_from_responses(
         thinking_config=thinking_config,
     )
 
-    # Debug: log the generated Kiro payload (truncated for readability)
-    try:
-        payload_str = _json.dumps(result.payload, ensure_ascii=False)
-        logger.debug(f"[Responses] kiro payload ({len(payload_str)} bytes): {payload_str[:2000]}")
-    except Exception:
-        pass
+    # Compact DEBUG summary of what will be sent to Kiro
+    _log_kiro_payload_summary(result.payload)
 
     return result.payload
